@@ -1,4 +1,5 @@
-"""Stage 4: validate every record against the schema and write books.json."""
+"""Stage 5: isolate failures per page, retry politely, write a run report."""
+import argparse
 import json
 import sys
 import time
@@ -16,14 +17,22 @@ REPO_URL = "https://github.com/AnelkaCH/2026Project-FlyRank-AI-Polite-Scraper-Pr
 USER_AGENT = f"FlyRankInternshipA9/1.0 (+{REPO_URL})"
 TIMEOUT = 10
 REQUEST_DELAY = 0.5
+RETRY_DELAY = 1.0
 MAX_PAGES = 3
 FIRST_CATALOGUE_URL = "https://books.toscrape.com/catalogue/page-1.html"
+TEST_BROKEN_BOOK_URL = (
+    "https://books.toscrape.com/catalogue/not-a-real-book_999999/index.html"
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = ROOT / "cache"
 OUTPUT_DIR = ROOT / "output"
 
 sys.stdout.reconfigure(encoding="utf-8")
+
+
+class PageFetchError(Exception):
+    pass
 
 
 def cache_file_for(page_number: int) -> Path:
@@ -35,25 +44,39 @@ def book_cache_file(book_url: str) -> Path:
     return CACHE_DIR / f"{slug}.html"
 
 
-def fetch_page(page_url: str, cache_file: Path) -> str:
+def fetch_page(page_url: str, cache_file: Path, stats: dict) -> str:
     if cache_file.exists():
-        html = cache_file.read_bytes().decode("utf-8")
+        stats["cache_hits"] += 1
         print(f"CACHE HIT {cache_file.name} ({cache_file.stat().st_size} bytes)")
-        return html
+        return cache_file.read_bytes().decode("utf-8")
 
-    time.sleep(REQUEST_DELAY)
-    response = requests.get(
-        page_url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT
-    )
-    if response.status_code != 200:
-        print(f"FAILED FETCH: {page_url} status {response.status_code}")
-        raise SystemExit(1)
+    last_error: str | None = None
+    for attempt in range(2):
+        time.sleep(REQUEST_DELAY if attempt == 0 else RETRY_DELAY)
+        try:
+            response = requests.get(
+                page_url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT
+            )
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            continue
+        except requests.RequestException as exc:
+            raise PageFetchError(f"{type(exc).__name__}: {exc}") from exc
 
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_file.write_bytes(response.content)
-    html = response.content.decode("utf-8")
-    print(f"FETCH {cache_file.name} ({len(response.content)} bytes)")
-    return html
+        if response.status_code == 200:
+            CACHE_DIR.mkdir(exist_ok=True)
+            cache_file.write_bytes(response.content)
+            stats["pages_fetched"] += 1
+            print(f"FETCH {cache_file.name} ({len(response.content)} bytes)")
+            return response.content.decode("utf-8")
+
+        if 500 <= response.status_code < 600:
+            last_error = f"server error {response.status_code}"
+            continue
+
+        raise PageFetchError(f"status {response.status_code}")
+
+    raise PageFetchError(f"after retry: {last_error}")
 
 
 def collect_book_urls(page_url: str, html: str) -> list[str]:
@@ -112,6 +135,10 @@ def iso_utc(timestamp: float) -> str:
     )
 
 
+def iso_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def build_finished_record(raw: dict) -> dict:
     return {
         **raw,
@@ -119,14 +146,35 @@ def build_finished_record(raw: dict) -> dict:
     }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Polite books.toscrape scraper")
+    parser.add_argument(
+        "--test-broken-book",
+        nargs="?",
+        const=TEST_BROKEN_BOOK_URL,
+        default=None,
+        metavar="URL",
+        help="add a made-up book URL to the crawl to prove failure isolation",
+    )
+    args = parser.parse_args(argv)
+
+    start_wall = time.monotonic()
+    start_iso = iso_now()
+    stats = {"pages_fetched": 0, "cache_hits": 0}
+
     sources: dict[str, str] = {}
+    failed_pages: list[dict] = []
     catalogue_pages = 0
     page_url = FIRST_CATALOGUE_URL
     page_number = 1
 
     while page_url and catalogue_pages < MAX_PAGES:
-        html = fetch_page(page_url, cache_file_for(page_number))
+        try:
+            html = fetch_page(page_url, cache_file_for(page_number), stats)
+        except PageFetchError as exc:
+            failed_pages.append({"url": page_url, "reason": str(exc)})
+            break
+
         for book_url in collect_book_urls(page_url, html):
             sources[book_url] = page_url
 
@@ -137,19 +185,34 @@ def main() -> int:
         catalogue_pages += 1
         page_number += 1
 
+    book_urls = list(sources)
+    if args.test_broken_book is not None:
+        book_urls.append(args.test_broken_book)
+
     good_records: list[dict] = []
     bad_records: list[dict] = []
     seen_urls: set[str] = set()
 
-    for book_url in sources:
+    for book_url in book_urls:
         if book_url in seen_urls:
             continue
         seen_urls.add(book_url)
 
         cache_file = book_cache_file(book_url)
-        html = fetch_page(book_url, cache_file)
+        try:
+            html = fetch_page(book_url, cache_file, stats)
+        except PageFetchError as exc:
+            failed_pages.append({"url": book_url, "reason": str(exc)})
+            continue
+
         fetched_at = iso_utc(cache_file.stat().st_mtime)
-        raw = parse_book_record(html, book_url, sources[book_url], fetched_at)
+        try:
+            raw = parse_book_record(
+                html, book_url, sources.get(book_url, FIRST_CATALOGUE_URL), fetched_at
+            )
+        except Exception as exc:
+            failed_pages.append({"url": book_url, "reason": f"parse error: {exc}"})
+            continue
 
         try:
             finished = build_finished_record(raw)
@@ -167,9 +230,29 @@ def main() -> int:
     (OUTPUT_DIR / "errors.json").write_text(
         json.dumps(bad_records, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    (OUTPUT_DIR / "run-report.json").write_text(
+        json.dumps(
+            {
+                "start_time": start_iso,
+                "duration_seconds": round(time.monotonic() - start_wall, 3),
+                "pages_fetched": stats["pages_fetched"],
+                "cache_hits": stats["cache_hits"],
+                "valid_records": len(good_records),
+                "invalid_records": len(bad_records),
+                "failed_pages": len(failed_pages),
+                "failed_page_urls": [f["url"] for f in failed_pages],
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
-    print(f"books_written={len(good_records)}, errors={len(bad_records)}")
-    return 0
+    print(
+        f"books_written={len(good_records)}, errors={len(bad_records)}, "
+        f"failed_pages={len(failed_pages)}"
+    )
+    return 1 if failed_pages or bad_records else 0
 
 
 if __name__ == "__main__":
