@@ -1,4 +1,4 @@
-# FlyRabk AI's Polite Scraper
+# FlyRank AI's Polite Scraper
 
 ## Overview
 This is a simple project that focuses on web scraping, but politely of course.
