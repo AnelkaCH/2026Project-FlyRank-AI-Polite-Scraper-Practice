@@ -1,0 +1,12 @@
+{
+  "start_time": "2026-08-08T14:14:02Z",
+  "duration_seconds": 2.261,
+  "pages_fetched": 0,
+  "cache_hits": 63,
+  "valid_records": 60,
+  "invalid_records": 0,
+  "failed_pages": 1,
+  "failed_page_urls": [
+    "https://books.toscrape.com/catalogue/not-a-real-book_999999/index.html"
+  ]
+}

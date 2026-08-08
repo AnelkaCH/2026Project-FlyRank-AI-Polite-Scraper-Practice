@@ -223,4 +223,6 @@ __marimo__/
 cache/
 
 # Generated output
-output/
+output/*
+!output/books.json
+!output/run-report.json
