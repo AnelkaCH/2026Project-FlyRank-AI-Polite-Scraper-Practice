@@ -221,3 +221,6 @@ __marimo__/
 
 # Local cache of downloaded pages
 cache/
+
+# Generated output
+output/

@@ -1,4 +1,4 @@
-"""Stage 3: fetch every book detail page and turn it into a raw record."""
+"""Stage 4: validate every record against the schema and write books.json."""
 import json
 import sys
 import time
@@ -8,6 +8,9 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import ValidationError
+
+from models import BookRecord, PriceParseError, parse_price
 
 REPO_URL = "https://github.com/AnelkaCH/2026Project-FlyRank-AI-Polite-Scraper-Practice"
 USER_AGENT = f"FlyRankInternshipA9/1.0 (+{REPO_URL})"
@@ -18,6 +21,7 @@ FIRST_CATALOGUE_URL = "https://books.toscrape.com/catalogue/page-1.html"
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = ROOT / "cache"
+OUTPUT_DIR = ROOT / "output"
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -108,6 +112,13 @@ def iso_utc(timestamp: float) -> str:
     )
 
 
+def build_finished_record(raw: dict) -> dict:
+    return {
+        **raw,
+        "price_gbp": parse_price(raw.get("price_text")),
+    }
+
+
 def main() -> int:
     sources: dict[str, str] = {}
     catalogue_pages = 0
@@ -126,17 +137,38 @@ def main() -> int:
         catalogue_pages += 1
         page_number += 1
 
-    records = []
+    good_records: list[dict] = []
+    bad_records: list[dict] = []
+    seen_urls: set[str] = set()
+
     for book_url in sources:
+        if book_url in seen_urls:
+            continue
+        seen_urls.add(book_url)
+
         cache_file = book_cache_file(book_url)
         html = fetch_page(book_url, cache_file)
         fetched_at = iso_utc(cache_file.stat().st_mtime)
-        records.append(
-            parse_book_record(html, book_url, sources[book_url], fetched_at)
-        )
+        raw = parse_book_record(html, book_url, sources[book_url], fetched_at)
 
-    print(json.dumps(records[0], indent=2, ensure_ascii=False))
-    print(f"detail_pages={len(records)}")
+        try:
+            finished = build_finished_record(raw)
+            record = BookRecord.model_validate(finished)
+        except (PriceParseError, ValidationError) as exc:
+            bad_records.append({"record": raw, "reason": str(exc)})
+            continue
+
+        good_records.append(record.model_dump())
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    (OUTPUT_DIR / "books.json").write_text(
+        json.dumps(good_records, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    (OUTPUT_DIR / "errors.json").write_text(
+        json.dumps(bad_records, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    print(f"books_written={len(good_records)}, errors={len(bad_records)}")
     return 0
 
 
