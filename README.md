@@ -1,7 +1,6 @@
 # FlyRank AI's Polite Scraper
 
 A small, polite web-scraping pipeline for `books.toscrape.com`: it downloads the first three catalogue pages, visits all 60 book pages, turns messy HTML into clean, validated JSON records, survives a broken page without crashing, and ends every run with a short report.
-
 ## Target Classification (Stage 0)
 
 - **Site:** `https://books.toscrape.com/` — a well-known public practice target for web scraping.
